@@ -1,0 +1,712 @@
+"""
+WeatherCast - Python Weather Prediction App
+Uses Open-Meteo API (free, no API key needed)
+Run: python weather_app.py
+"""
+
+import tkinter as tk
+from tkinter import ttk
+import urllib.request
+import urllib.parse
+import urllib.error
+import ssl
+import queue
+import traceback
+import json
+import threading
+import math
+from datetime import datetime
+
+# ───────────────────────── API LAYER ─────────────────────────
+BASE_URL = "https://api.open-meteo.com/v1/forecast"
+GEO_URL  = "https://geocoding-api.open-meteo.com/v1/search"
+
+
+AQI_URL = "https://air-quality-api.open-meteo.com/v1/air-quality"
+
+# Indian cities: name -> (lat, lon, state). Instant load, no geocoding call.
+INDIAN_CITIES = {
+    "Raipur": (21.2514, 81.6296, "Chhattisgarh"),
+    "Bhilai": (21.2167, 81.3833, "Chhattisgarh"),
+    "Bilaspur": (22.0797, 82.1409, "Chhattisgarh"),
+    "Delhi": (28.6139, 77.2090, "Delhi"),
+    "Mumbai": (19.0760, 72.8777, "Maharashtra"),
+    "Pune": (18.5204, 73.8567, "Maharashtra"),
+    "Nagpur": (21.1458, 79.0882, "Maharashtra"),
+    "Kolkata": (22.5726, 88.3639, "West Bengal"),
+    "Chennai": (13.0827, 80.2707, "Tamil Nadu"),
+    "Bengaluru": (12.9716, 77.5946, "Karnataka"),
+    "Hyderabad": (17.3850, 78.4867, "Telangana"),
+    "Visakhapatnam": (17.6868, 83.2185, "Andhra Pradesh"),
+    "Kochi": (9.9312, 76.2673, "Kerala"),
+    "Ahmedabad": (23.0225, 72.5714, "Gujarat"),
+    "Surat": (21.1702, 72.8311, "Gujarat"),
+    "Jaipur": (26.9124, 75.7873, "Rajasthan"),
+    "Lucknow": (26.8467, 80.9462, "Uttar Pradesh"),
+    "Varanasi": (25.3176, 82.9739, "Uttar Pradesh"),
+    "Bhopal": (23.2599, 77.4126, "Madhya Pradesh"),
+    "Indore": (22.7196, 75.8577, "Madhya Pradesh"),
+    "Patna": (25.5941, 85.1376, "Bihar"),
+    "Ranchi": (23.3441, 85.3096, "Jharkhand"),
+    "Bhubaneswar": (20.2961, 85.8245, "Odisha"),
+    "Guwahati": (26.1445, 91.7362, "Assam"),
+    "Chandigarh": (30.7333, 76.7794, "Chandigarh"),
+    "Dehradun": (30.3165, 78.0322, "Uttarakhand"),
+}
+
+
+def aqi_label(aqi):
+    if aqi is None: return "N/A"
+    if aqi <= 50:   return "Good"
+    if aqi <= 100:  return "Moderate"
+    if aqi <= 150:  return "Unhealthy (sensitive)"
+    if aqi <= 200:  return "Unhealthy"
+    if aqi <= 300:  return "Very Unhealthy"
+    return "Hazardous"
+
+
+def fetch_aqi(lat, lon):
+    url = (f"{AQI_URL}?latitude={lat}&longitude={lon}"
+           "&current=us_aqi,pm2_5,pm10&timezone=auto")
+    return fetch_json(url).get("current")
+
+
+def fetch_json(url: str) -> dict:
+    req = urllib.request.Request(url, headers={"User-Agent": "WeatherCast/1.0"})
+    try:
+        with urllib.request.urlopen(req, timeout=20) as r:
+            return json.loads(r.read().decode())
+    except urllib.error.URLError as e:
+        # Some Python installs (esp. macOS) lack SSL certs -> retry once
+        if isinstance(getattr(e, "reason", None), ssl.SSLError):
+            ctx = ssl._create_unverified_context()
+            with urllib.request.urlopen(req, timeout=20, context=ctx) as r:
+                return json.loads(r.read().decode())
+        raise
+
+
+def geocode(city: str, india_only: bool = True) -> dict:
+    # Known Indian city -> instant, no network call
+    for name, (lat, lon, state) in INDIAN_CITIES.items():
+        if name.lower() == city.strip().lower():
+            return {"lat": lat, "lon": lon, "city": name, "region": state, "country": "IN"}
+    base = f"{GEO_URL}?name={urllib.parse.quote(city)}&count=1&language=en&format=json"
+    data = fetch_json(base + "&countryCode=IN")          # India first
+    if not data.get("results"):
+        if india_only:
+            raise ValueError(f'No Indian city found for "{city}"')
+        data = fetch_json(base)                           # fall back to worldwide
+    if not data.get("results"):
+        raise ValueError(f'No city found for "{city}"')
+    r = data["results"][0]
+    return {
+        "lat": r["latitude"],
+        "lon": r["longitude"],
+        "city": r.get("name", city),
+        "region": r.get("admin1", ""),
+        "country": r.get("country_code", ""),
+    }
+
+
+def fetch_weather(lat: float, lon: float) -> dict:
+    params = (
+        f"latitude={lat}&longitude={lon}"
+        "&current=temperature_2m,relative_humidity_2m,apparent_temperature,"
+        "is_day,precipitation,weather_code,wind_speed_10m,wind_direction_10m,"
+        "surface_pressure"
+        "&hourly=temperature_2m,apparent_temperature,precipitation_probability,"
+        "weather_code,is_day"
+        "&daily=weather_code,temperature_2m_max,temperature_2m_min,sunrise,"
+        "sunset,precipitation_probability_max,uv_index_max,wind_speed_10m_max"
+        "&timezone=auto&forecast_days=7"
+    )
+    return fetch_json(f"{BASE_URL}?{params}")
+
+
+# ───────────────────────── HELPERS ─────────────────────────
+WMO_MAP = {
+    0:  ("Clear sky", "☀", "🌙"),
+    1:  ("Mainly clear", "🌤", "🌙"),
+    2:  ("Partly cloudy", "⛅", "⛅"),
+    3:  ("Overcast", "☁", "☁"),
+    45: ("Foggy", "🌫", "🌫"),
+    48: ("Icy fog", "🌫", "🌫"),
+    51: ("Light drizzle", "🌦", "🌦"),
+    53: ("Moderate drizzle", "🌧", "🌧"),
+    55: ("Dense drizzle", "🌧", "🌧"),
+    56: ("Freezing drizzle", "🌧", "🌧"),
+    57: ("Freezing drizzle", "🌧", "🌧"),
+    61: ("Slight rain", "🌧", "🌧"),
+    63: ("Moderate rain", "🌧", "🌧"),
+    65: ("Heavy rain", "⛈", "⛈"),
+    66: ("Freezing rain", "🌧", "🌧"),
+    67: ("Freezing rain", "🌧", "🌧"),
+    71: ("Slight snow", "🌨", "🌨"),
+    73: ("Moderate snow", "❄", "❄"),
+    75: ("Heavy snow", "❄", "❄"),
+    77: ("Snow grains", "❄", "❄"),
+    80: ("Rain showers", "🌦", "🌦"),
+    81: ("Heavy showers", "🌧", "🌧"),
+    82: ("Violent showers", "⛈", "⛈"),
+    85: ("Snow showers", "🌨", "🌨"),
+    86: ("Heavy snow showers", "🌨", "🌨"),
+    95: ("Thunderstorm", "⛈", "⛈"),
+    96: ("Thunderstorm + hail", "🌩", "🌩"),
+    99: ("Thunderstorm + hail", "🌩", "🌩"),
+}
+
+
+def wmo_info(code, is_day=True):
+    info = WMO_MAP.get(code, ("Unknown", "?", "?"))
+    return info[0], (info[1] if is_day else info[2])
+
+
+def uv_label(uv):
+    if uv <= 2:  return "Low"
+    if uv <= 5:  return "Moderate"
+    if uv <= 7:  return "High"
+    if uv <= 10: return "Very High"
+    return "Extreme"
+
+
+def wind_direction(deg):
+    return ["N", "NE", "E", "SE", "S", "SW", "W", "NW"][round(deg / 45) % 8]
+
+
+def pressure_label(hpa):
+    if hpa > 1020: return "High ↑"
+    if hpa < 1000: return "Low ↓"
+    return "Normal"
+
+
+def to_fahrenheit(c):
+    return c * 9 / 5 + 32
+
+
+THEMES = {
+    "clear_day":   {"bg": "#1e78e8", "card": "#1560be", "accent": "#FFD700", "text": "#ffffff", "muted": "#d0e8ff"},
+    "clear_night": {"bg": "#0d1b3e", "card": "#1a2655", "accent": "#FFD700", "text": "#ffffff", "muted": "#8090b8"},
+    "cloudy":      {"bg": "#485563", "card": "#363f48", "accent": "#ffce3d", "text": "#ffffff", "muted": "#aab4c0"},
+    "rainy":       {"bg": "#1c2b3a", "card": "#162230", "accent": "#74c0fc", "text": "#ffffff", "muted": "#7090b0"},
+    "snowy":       {"bg": "#a8c0cc", "card": "#8aaabb", "accent": "#ffffff", "text": "#1a2a3a", "muted": "#3a5a7a"},
+    "stormy":      {"bg": "#1a1a2e", "card": "#0f1428", "accent": "#d0a0ff", "text": "#ffffff", "muted": "#7070a0"},
+}
+
+
+CHROME = THEMES["clear_night"]   # header/search bar keep fixed colours
+
+
+def get_theme(code, is_day):
+    if code in (95, 96, 99):                                   return THEMES["stormy"]
+    if code in (71, 73, 75, 77, 85, 86):                       return THEMES["snowy"]
+    if code in (51, 53, 55, 56, 57, 61, 63, 65, 66, 67, 80, 81, 82): return THEMES["rainy"]
+    if code in (3, 45, 48):                                    return THEMES["cloudy"]
+    return THEMES["clear_day"] if is_day else THEMES["clear_night"]
+
+
+# ───────────────────────── APP ─────────────────────────
+class WeatherApp(tk.Tk):
+    def __init__(self):
+        super().__init__()
+        self.title("WeatherCast")
+        self.geometry("1000x820")
+        self.minsize(720, 560)
+        self.configure(bg="#0d1b3e")
+
+        self.unit = tk.StringVar(value="C")
+        self.theme = THEMES["clear_night"]
+        self._raw_data = None
+        self._location = {}
+        self._aqi = None
+        self.india_only = tk.BooleanVar(value=True)
+        self._q = queue.Queue()          # worker thread -> UI thread
+        self._canvas_now = None
+        self._canvas_7day = None
+
+        self._build_ui()
+        self._poll_queue()
+        self.bind_all("<MouseWheel>", self._on_wheel)
+        self.bind_all("<Button-4>", self._on_wheel)
+        self.bind_all("<Button-5>", self._on_wheel)
+        self.after(300, lambda: self._search_thread("Raipur"))
+
+    def _build_ui(self):
+        t = self.theme
+
+        top = tk.Frame(self, bg=t["bg"], pady=12)
+        top.pack(fill="x")
+        tk.Label(top, text="WeatherCast", font=("Georgia", 22, "bold"),
+                 bg=t["bg"], fg=t["accent"]).pack(side="left", padx=20)
+
+        uf = tk.Frame(top, bg=t["bg"])
+        uf.pack(side="right", padx=20)
+        self.btn_c = tk.Button(uf, text="°C", width=4, command=lambda: self._set_unit("C"),
+                               relief="flat", bg=t["accent"], fg="#1a1a1a",
+                               font=("Arial", 10, "bold"), cursor="hand2", bd=0)
+        self.btn_c.pack(side="left", padx=2)
+        self.btn_f = tk.Button(uf, text="°F", width=4, command=lambda: self._set_unit("F"),
+                               relief="flat", bg=t["card"], fg=t["muted"],
+                               font=("Arial", 10), cursor="hand2", bd=0)
+        self.btn_f.pack(side="left", padx=2)
+
+        sf = tk.Frame(self, bg=t["bg"], pady=10)
+        sf.pack(fill="x", padx=20)
+
+        self.search_var = tk.StringVar()
+        self.entry = tk.Entry(sf, textvariable=self.search_var, width=40,
+                              font=("Arial", 13), bg=t["card"], fg=t["text"],
+                              insertbackground=t["text"], relief="flat",
+                              highlightthickness=1, highlightcolor=t["accent"],
+                              highlightbackground=t["muted"])
+        self.entry.pack(side="left", ipady=8, ipadx=8, padx=(0, 8))
+        self.entry.insert(0, "Search city…")
+        self.entry.bind("<FocusIn>", lambda e: self._clear_placeholder())
+        self.entry.bind("<FocusOut>", lambda e: self._restore_placeholder())
+        self.entry.bind("<Return>", lambda e: self._on_search())
+
+        self.search_btn = tk.Button(sf, text="Search", command=self._on_search,
+                                    bg=t["accent"], fg="#1a1a1a",
+                                    font=("Arial", 11, "bold"), relief="flat",
+                                    padx=18, pady=6, cursor="hand2")
+        self.search_btn.pack(side="left")
+
+        self.india_chk = tk.Checkbutton(sf, text="India only", variable=self.india_only,
+                                        bg=t["bg"], fg=t["text"], selectcolor=t["card"],
+                                        activebackground=t["bg"], activeforeground=t["text"])
+        self.india_chk.pack(side="left", padx=10)
+
+
+        # Indian city quick-select chips
+        self.chip_frame = tk.Frame(self, bg=t["bg"])
+        self.chip_frame.pack(fill="x", padx=20, pady=(0, 6))
+        self.chip_btns = []
+        names = list(INDIAN_CITIES)
+        per_row = 9
+        for i, name in enumerate(names):
+            b = tk.Button(self.chip_frame, text=name, font=("Arial", 9), relief="flat",
+                          bg=t["card"], fg=t["text"], cursor="hand2", padx=8, pady=3, bd=0,
+                          command=lambda n=name: self._search_thread(n))
+            b.grid(row=i // per_row, column=i % per_row, padx=2, pady=2, sticky="w")
+            self.chip_btns.append(b)
+
+        self.status_lbl = tk.Label(self, text="", font=("Arial", 10), bg=t["bg"],
+                                   fg="#ff8888", anchor="w", justify="left", wraplength=940)
+        self.status_lbl.pack(fill="x", padx=20)
+
+        style = ttk.Style()
+        style.theme_use("default")
+        style.configure("TNotebook", background=t["bg"], borderwidth=0)
+        style.configure("TNotebook.Tab", background=t["card"], foreground=t["muted"],
+                        padding=[14, 6], font=("Arial", 10))
+        style.map("TNotebook.Tab",
+                  background=[("selected", t["bg"])],
+                  foreground=[("selected", t["accent"])])
+
+        self.nb = ttk.Notebook(self)
+        self.nb.pack(fill="both", expand=True, padx=12, pady=(0, 12))
+
+        self.tab_now = tk.Frame(self.nb, bg=t["bg"])
+        self.tab_hourly = tk.Frame(self.nb, bg=t["bg"])
+        self.tab_7day = tk.Frame(self.nb, bg=t["bg"])
+        self.nb.add(self.tab_now, text="  Now  ")
+        self.nb.add(self.tab_hourly, text="  48-Hour  ")
+        self.nb.add(self.tab_7day, text="  7-Day  ")
+
+        ftr = tk.Frame(self, bg=t["bg"])
+        ftr.pack(fill="x")
+        tk.Label(ftr, text="Data from Open-Meteo (weather + air quality) • Free • No API key",
+                 font=("Arial", 9), bg=t["bg"], fg=t["muted"]).pack(pady=4)
+
+    # ── search handlers ──
+    def _clear_placeholder(self):
+        if self.search_var.get() == "Search city…":
+            self.entry.delete(0, "end")
+
+    def _restore_placeholder(self):
+        if not self.search_var.get():
+            self.entry.insert(0, "Search city…")
+
+    def _on_search(self):
+        q = self.search_var.get().strip()
+        if not q or q == "Search city…":
+            return
+        self._search_thread(q)
+
+    def _set_unit(self, u):
+        self.unit.set(u)
+        t = CHROME
+        self.btn_c.configure(bg=t["accent"] if u == "C" else t["card"],
+                             fg="#1a1a1a" if u == "C" else t["muted"])
+        self.btn_f.configure(bg=t["accent"] if u == "F" else t["card"],
+                             fg="#1a1a1a" if u == "F" else t["muted"])
+        if self._raw_data:
+            self._render_all()
+
+    # ── background thread ──
+    def _search_thread(self, city):
+        self.status_lbl.configure(text="Fetching…", fg="#ffce3d")
+        self.search_btn.configure(state="disabled")
+        threading.Thread(target=self._load_data, args=(city,), daemon=True).start()
+
+    def _poll_queue(self):
+        try:
+            while True:
+                self._q.get_nowait()()
+        except queue.Empty:
+            pass
+        self.after(100, self._poll_queue)
+
+    def _load_data(self, city):
+        try:
+            loc = geocode(city, self.india_only.get())
+            data = fetch_weather(loc["lat"], loc["lon"])
+            try:
+                aqi = fetch_aqi(loc["lat"], loc["lon"])
+            except Exception:
+                aqi = None                                 # AQI is optional
+
+            def done():
+                self._raw_data, self._location, self._aqi = data, loc, aqi
+                try:
+                    self._render_all()
+                    self.status_lbl.configure(text="", fg="#ff8888")
+                except Exception as e:
+                    traceback.print_exc()
+                    self.status_lbl.configure(text=f"⚠ Display error: {e!r}", fg="#ff8888")
+                self.search_btn.configure(state="normal")
+            self._q.put(done)
+        except Exception as e:
+            traceback.print_exc()
+            msg = f"⚠ {type(e).__name__}: {e}"
+
+            def fail():
+                self.status_lbl.configure(text=msg, fg="#ff8888")
+                self.search_btn.configure(state="normal")
+            self._q.put(fail)
+
+    # ── unit helpers ──
+    def _fmt(self, c):
+        if self.unit.get() == "C":
+            return f"{round(c)}°C"
+        return f"{round(to_fahrenheit(c))}°F"
+
+    def _fnum(self, c):
+        return str(round(c if self.unit.get() == "C" else to_fahrenheit(c)))
+
+    # ── theme ──
+    def _apply_theme(self, theme):
+        self.theme = t = theme
+        style = ttk.Style()
+        style.configure("TNotebook", background=CHROME["bg"])
+        style.configure("TNotebook.Tab", background=CHROME["card"], foreground=CHROME["muted"])
+        style.map("TNotebook.Tab",
+                  background=[("selected", t["bg"])],
+                  foreground=[("selected", t["accent"])])
+        for tab in (self.tab_now, self.tab_hourly, self.tab_7day):
+            tab.configure(bg=t["bg"])
+
+    def _on_wheel(self, e):
+        try:
+            idx = self.nb.index(self.nb.select())
+        except tk.TclError:
+            return
+        canvas = {0: self._canvas_now, 2: self._canvas_7day}.get(idx)
+        if canvas is None:
+            return
+        if getattr(e, "num", 0) == 4:
+            canvas.yview_scroll(-3, "units")
+        elif getattr(e, "num", 0) == 5:
+            canvas.yview_scroll(3, "units")
+        else:
+            canvas.yview_scroll(int(-e.delta / 120) * 3 or (-3 if e.delta > 0 else 3), "units")
+
+    def _render_all(self):
+        d, loc, c = self._raw_data, self._location, self._raw_data["current"]
+        t = get_theme(c["weather_code"], bool(c["is_day"]))
+        self._apply_theme(t)
+        self._render_now(d, loc, c, t)
+        self._render_hourly(d, t)
+        self._render_7day(d, t)
+
+    # ── NOW tab ──
+    def _render_now(self, d, loc, c, t):
+        for w in self.tab_now.winfo_children():
+            w.destroy()
+
+        label, icon = wmo_info(c["weather_code"], bool(c["is_day"]))
+        local_now = datetime.fromisoformat(c["time"])   # city's local time
+        now_str = local_now.strftime("%A, %d %b %Y  •  %H:%M")
+
+        canvas = tk.Canvas(self.tab_now, bg=t["bg"], highlightthickness=0)
+        self._canvas_now = canvas
+        sb = ttk.Scrollbar(self.tab_now, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=t["bg"])
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        def lbl(parent, text, size=12, bold=False, color=None, pady=0):
+            tk.Label(parent, text=text,
+                     font=("Arial", size, "bold" if bold else "normal"),
+                     bg=t["bg"], fg=color or t["text"], anchor="w"
+                     ).pack(fill="x", padx=20, pady=pady)
+
+        def card_frame(parent, padx=20, pady=6):
+            f = tk.Frame(parent, bg=t["card"], padx=12, pady=10)
+            f.pack(fill="x", padx=padx, pady=pady)
+            return f
+
+        lbl(inner, loc["city"], 22, bold=True, pady=12)
+        lbl(inner, f"{loc['region']}  {loc['country']}", 11, color=t["muted"])
+        lbl(inner, now_str, 10, color=t["muted"], pady=2)
+
+        row = card_frame(inner, pady=10)
+        tk.Label(row, text=icon, font=("Segoe UI Emoji", 56),
+                 bg=t["card"], fg=t["text"]).pack(side="left", padx=10)
+        info_f = tk.Frame(row, bg=t["card"])
+        info_f.pack(side="left", padx=10)
+        tk.Label(info_f, text=self._fmt(c["temperature_2m"]),
+                 font=("Georgia", 52, "bold"), bg=t["card"], fg=t["text"]).pack(anchor="w")
+        tk.Label(info_f, text=label, font=("Arial", 14),
+                 bg=t["card"], fg=t["muted"]).pack(anchor="w")
+        tk.Label(info_f, text=f"Feels like {self._fmt(c['apparent_temperature'])}",
+                 font=("Arial", 11), bg=t["card"], fg=t["muted"]).pack(anchor="w")
+
+        lbl(inner, "Current Conditions", 13, bold=True, pady=(16, 4))
+        g = tk.Frame(inner, bg=t["bg"])
+        g.pack(fill="x", padx=20, pady=4)
+        g.columnconfigure((0, 1, 2), weight=1, uniform="col")
+
+        uv_today = d["daily"]["uv_index_max"][0] or 0
+        stats = [
+            ("💧 Humidity", f"{c['relative_humidity_2m']}%", ""),
+            ("🌬 Wind", f"{round(c['wind_speed_10m'])} km/h", wind_direction(c["wind_direction_10m"])),
+            ("☀ UV Index (max)", f"{round(uv_today)}", uv_label(uv_today)),
+            ("🌡 Pressure", f"{round(c['surface_pressure'])} hPa", pressure_label(c["surface_pressure"])),
+            ("🌧 Precip", f"{c['precipitation']} mm", "now"),
+            ("📅 High/Low",
+             f"{self._fmt(d['daily']['temperature_2m_max'][0])} / {self._fmt(d['daily']['temperature_2m_min'][0])}", ""),
+        ]
+        for i, (title, val, sub) in enumerate(stats):
+            cf = tk.Frame(g, bg=t["card"], padx=10, pady=10)
+            cf.grid(row=i // 3, column=i % 3, sticky="nsew", padx=4, pady=4)
+            tk.Label(cf, text=title, font=("Arial", 9), bg=t["card"], fg=t["muted"], anchor="w").pack(fill="x")
+            tk.Label(cf, text=val, font=("Arial", 16, "bold"), bg=t["card"], fg=t["text"], anchor="w").pack(fill="x")
+            if sub:
+                tk.Label(cf, text=sub, font=("Arial", 9), bg=t["card"], fg=t["muted"], anchor="w").pack(fill="x")
+
+        lbl(inner, "Air Quality (US AQI)", 13, bold=True, pady=(16, 4))
+        af = card_frame(inner)
+        a = self._aqi or {}
+        aqi_val = a.get("us_aqi")
+        for title, val, sub in [
+            ("AQI", "–" if aqi_val is None else str(round(aqi_val)), aqi_label(aqi_val)),
+            ("PM2.5", "–" if a.get("pm2_5") is None else f"{a['pm2_5']:.0f} µg/m³", ""),
+            ("PM10", "–" if a.get("pm10") is None else f"{a['pm10']:.0f} µg/m³", ""),
+        ]:
+            ff = tk.Frame(af, bg=t["card"])
+            ff.pack(side="left", expand=True)
+            tk.Label(ff, text=title, font=("Arial", 9), bg=t["card"], fg=t["muted"]).pack()
+            tk.Label(ff, text=val, font=("Arial", 16, "bold"), bg=t["card"], fg=t["text"]).pack()
+            if sub:
+                tk.Label(ff, text=sub, font=("Arial", 9), bg=t["card"], fg=t["accent"]).pack()
+
+        lbl(inner, "Sun", 13, bold=True, pady=(16, 4))
+        sf2 = card_frame(inner)
+        sr = d["daily"]["sunrise"][0].split("T")[1]
+        ss = d["daily"]["sunset"][0].split("T")[1]
+        for side, ic, name, val in [("left", "🌅", "Sunrise", sr), ("right", "🌇", "Sunset", ss)]:
+            ff = tk.Frame(sf2, bg=t["card"])
+            ff.pack(side=side, expand=True, fill="x")
+            tk.Label(ff, text=ic, font=("Segoe UI Emoji", 24), bg=t["card"], fg=t["text"]).pack()
+            tk.Label(ff, text=name, font=("Arial", 9), bg=t["card"], fg=t["muted"]).pack()
+            tk.Label(ff, text=val, font=("Arial", 16, "bold"), bg=t["card"], fg=t["text"]).pack()
+
+        arc_c = tk.Canvas(inner, bg=t["card"], height=90, highlightthickness=0)
+        arc_c.pack(fill="x", padx=20, pady=(0, 6))
+        arc_c.bind("<Configure>", lambda e: self._draw_sun_arc(arc_c, sr, ss, local_now, t))
+
+        lbl(inner, "Wind Detail", 13, bold=True, pady=(16, 4))
+        wf = card_frame(inner)
+        wdir = wind_direction(c["wind_direction_10m"])
+        tk.Label(wf, text=f"Speed: {round(c['wind_speed_10m'])} km/h  |  "
+                          f"Direction: {wdir} ({round(c['wind_direction_10m'])}°)",
+                 font=("Arial", 12), bg=t["card"], fg=t["text"]).pack(anchor="w")
+        self._draw_wind_compass(wf, c["wind_direction_10m"], t)
+
+        tk.Frame(inner, bg=t["bg"], height=20).pack()
+
+    def _draw_sun_arc(self, canvas, sunrise, sunset, now, t):
+        canvas.delete("all")
+        W = canvas.winfo_width() or 860
+        H = 90
+        cx, cy = W // 2, H - 25
+        rx, ry = W // 2 - 30, H - 40
+
+        sr_h, sr_m = map(int, sunrise.split(":"))
+        ss_h, ss_m = map(int, sunset.split(":"))
+        now_mins = now.hour * 60 + now.minute
+        sr_mins = sr_h * 60 + sr_m
+        ss_mins = ss_h * 60 + ss_m
+        pct = max(0.0, min(1.0, (now_mins - sr_mins) / max(ss_mins - sr_mins, 1)))
+
+        canvas.create_arc(cx - rx, cy - ry, cx + rx, cy + ry, start=0, extent=180,
+                          style="arc", outline=t["muted"], width=2)
+        ang = math.radians(180 - pct * 180)
+        sx = cx + rx * math.cos(ang)
+        sy = cy - ry * math.sin(ang)
+        canvas.create_oval(sx - 10, sy - 10, sx + 10, sy + 10, fill=t["accent"], outline="")
+        canvas.create_text(cx - rx, cy + 14, text=sunrise, fill=t["muted"], font=("Arial", 9))
+        canvas.create_text(cx + rx, cy + 14, text=sunset, fill=t["muted"], font=("Arial", 9))
+        canvas.create_text(cx, cy + 14, text=f"{round(pct * 100)}% of daylight",
+                           fill=t["muted"], font=("Arial", 9))
+
+    def _draw_wind_compass(self, parent, deg, t):
+        size = 100
+        c = tk.Canvas(parent, bg=t["card"], width=size, height=size, highlightthickness=0)
+        c.pack(pady=8)
+        cx = cy = size // 2
+        r = size // 2 - 10
+        c.create_oval(cx - r, cy - r, cx + r, cy + r, outline=t["muted"], fill=t["card"], width=1)
+        for name, a in [("N", 90), ("E", 0), ("S", 270), ("W", 180)]:
+            rd = math.radians(a)
+            c.create_text(cx + (r - 10) * math.cos(rd), cy - (r - 10) * math.sin(rd),
+                          text=name, fill=t["muted"], font=("Arial", 8, "bold"))
+        # wind_direction = where wind comes FROM; arrow points where it blows TO
+        rad = math.radians(90 - (deg + 180))
+        ax, ay = cx + (r - 18) * math.cos(rad), cy - (r - 18) * math.sin(rad)
+        c.create_line(cx, cy, ax, ay, fill=t["accent"], width=3, arrow="last")
+
+    # ── 48-HOUR tab ──
+    def _render_hourly(self, d, t):
+        for w in self.tab_hourly.winfo_children():
+            w.destroy()
+
+        frame = tk.Frame(self.tab_hourly, bg=t["bg"])
+        frame.pack(fill="both", expand=True)
+        tk.Label(frame, text="48-Hour Forecast", font=("Georgia", 15, "bold"),
+                 bg=t["bg"], fg=t["accent"], pady=10).pack()
+
+        cols = ("Time", "Icon", "Temp", "Feels Like", "Rain %", "Condition")
+        tv = ttk.Treeview(frame, columns=cols, show="headings", height=22)
+        sb = ttk.Scrollbar(frame, orient="vertical", command=tv.yview)
+        tv.configure(yscrollcommand=sb.set)
+
+        style = ttk.Style()
+        style.configure("Treeview", background=t["card"], fieldbackground=t["card"],
+                        foreground=t["text"], rowheight=28, font=("Arial", 10))
+        style.configure("Treeview.Heading", background=t["bg"], foreground=t["accent"],
+                        font=("Arial", 10, "bold"))
+        style.map("Treeview", background=[("selected", t["accent"])],
+                  foreground=[("selected", "#1a1a1a")])
+
+        for col, w2 in zip(cols, [90, 40, 80, 90, 60, 160]):
+            tv.heading(col, text=col)
+            tv.column(col, width=w2, anchor="center")
+
+        h = d["hourly"]
+        now_key = d["current"]["time"][:13] + ":00"      # city's current hour
+        start = h["time"].index(now_key) if now_key in h["time"] else 0
+
+        for n, i in enumerate(range(start, min(start + 48, len(h["time"])))):
+            dt = datetime.fromisoformat(h["time"][i])
+            cond, icon = wmo_info(h["weather_code"][i], bool(h["is_day"][i]))
+            rain = h["precipitation_probability"][i]
+            tv.insert("", "end", tags=("even" if n % 2 == 0 else "odd",), values=(
+                dt.strftime("%a %H:%M"), icon,
+                f"{self._fnum(h['temperature_2m'][i])}°",
+                f"{self._fnum(h['apparent_temperature'][i])}°",
+                f"{rain if rain is not None else 0}%", cond))
+
+        tv.tag_configure("even", background=t["card"])
+        tv.tag_configure("odd", background=t["bg"])
+        tv.pack(side="left", fill="both", expand=True, padx=(12, 0), pady=8)
+        sb.pack(side="right", fill="y", pady=8, padx=(0, 4))
+
+    # ── 7-DAY tab ──
+    def _render_7day(self, d, t):
+        for w in self.tab_7day.winfo_children():
+            w.destroy()
+
+        canvas = tk.Canvas(self.tab_7day, bg=t["bg"], highlightthickness=0)
+        self._canvas_7day = canvas
+        sb = ttk.Scrollbar(self.tab_7day, orient="vertical", command=canvas.yview)
+        canvas.configure(yscrollcommand=sb.set)
+        sb.pack(side="right", fill="y")
+        canvas.pack(side="left", fill="both", expand=True)
+
+        inner = tk.Frame(canvas, bg=t["bg"])
+        win = canvas.create_window((0, 0), window=inner, anchor="nw")
+        canvas.bind("<Configure>", lambda e: canvas.itemconfig(win, width=e.width))
+        inner.bind("<Configure>", lambda e: canvas.configure(scrollregion=canvas.bbox("all")))
+
+        tk.Label(inner, text="7-Day Outlook", font=("Georgia", 15, "bold"),
+                 bg=t["bg"], fg=t["accent"], pady=10).pack()
+
+        daily = d["daily"]
+        g_min = min(daily["temperature_2m_min"])
+        g_max = max(daily["temperature_2m_max"])
+        g_rng = max(g_max - g_min, 1)
+
+        for i, date_str in enumerate(daily["time"]):
+            dt = datetime.fromisoformat(date_str)
+            name = "Today" if i == 0 else ("Tomorrow" if i == 1 else dt.strftime("%A, %d %b"))
+            cond, icon = wmo_info(daily["weather_code"][i], True)
+            lo = daily["temperature_2m_min"][i]
+            hi = daily["temperature_2m_max"][i]
+            rain = daily["precipitation_probability_max"][i] or 0
+            uv = daily["uv_index_max"][i] or 0
+
+            row = tk.Frame(inner, bg=t["card"], pady=10, padx=14)
+            row.pack(fill="x", padx=14, pady=4)
+
+            tk.Label(row, text=name, font=("Arial", 11, "bold"), bg=t["card"],
+                     fg=t["text"], width=16, anchor="w").pack(side="left")
+            tk.Label(row, text=f"{icon}  {cond}", font=("Arial", 11), bg=t["card"],
+                     fg=t["muted"], width=22, anchor="w").pack(side="left")
+            tk.Label(row, text=f"💧{rain}%", font=("Arial", 10), bg=t["card"],
+                     fg="#74c0fc", width=8).pack(side="left")
+            tk.Label(row, text=f"UV {round(uv)}", font=("Arial", 10), bg=t["card"],
+                     fg=t["muted"], width=6).pack(side="left")
+
+            bar_f = tk.Frame(row, bg=t["card"])
+            bar_f.pack(side="left", fill="x", expand=True, padx=8)
+            bar = tk.Canvas(bar_f, bg=t["bg"], height=8, highlightthickness=0)
+            bar.pack(fill="x", pady=4)
+
+            def draw_bar(e, bar=bar, lo=lo, hi=hi):
+                bar.delete("all")
+                W = e.width
+                x0 = int((lo - g_min) / g_rng * W)
+                x1 = max(int((hi - g_min) / g_rng * W), x0 + 4)
+                bar.create_rectangle(x0, 0, x1, 8, fill=t["accent"], outline="")
+            bar.bind("<Configure>", draw_bar)
+
+            tk.Label(row, text=self._fmt(hi), font=("Arial", 11, "bold"),
+                     bg=t["card"], fg=t["text"]).pack(side="left")
+            tk.Label(row, text=f"/{self._fmt(lo)}", font=("Arial", 11),
+                     bg=t["card"], fg=t["muted"]).pack(side="left")
+
+        tk.Label(inner, text="Week Summary", font=("Georgia", 13, "bold"),
+                 bg=t["bg"], fg=t["accent"]).pack(pady=(14, 4))
+        sf = tk.Frame(inner, bg=t["card"], padx=16, pady=12)
+        sf.pack(fill="x", padx=14, pady=4)
+        for name, val in [
+            ("Weekly High", self._fmt(max(daily["temperature_2m_max"]))),
+            ("Weekly Low", self._fmt(min(daily["temperature_2m_min"]))),
+            ("Max Rain Chance", f"{max(x or 0 for x in daily['precipitation_probability_max'])}%"),
+        ]:
+            f = tk.Frame(sf, bg=t["card"])
+            f.pack(side="left", expand=True)
+            tk.Label(f, text=name, font=("Arial", 9), bg=t["card"], fg=t["muted"]).pack()
+            tk.Label(f, text=val, font=("Arial", 18, "bold"), bg=t["card"], fg=t["text"]).pack()
+
+        tk.Frame(inner, bg=t["bg"], height=20).pack()
+
+
+if __name__ == "__main__":
+    WeatherApp().mainloop()
