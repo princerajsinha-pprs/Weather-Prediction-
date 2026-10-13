@@ -5,7 +5,7 @@ A desktop weather application built with Python and Tkinter. WeatherCast display
 ## Student / Developer Details
 
 - **Name:** Prince Raj
-- **Email:** princerajsinha9792gmail.com
+- **Email:** princerajsinha979@gmail.com
 
 > Note: The email address above is written exactly as provided. If you intended a conventional email address, check whether an `@` symbol is missing.
 
@@ -119,7 +119,7 @@ Weather and air-quality data require an active internet connection. Air-quality 
 ## Author
 
 **Prince Raj**  
-Email: `princerajsinha9792gmail.com`
+Email: `princerajsinha979@gmail.com`
 
 ## License
 
